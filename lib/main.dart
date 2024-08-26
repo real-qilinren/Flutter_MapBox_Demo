@@ -1,5 +1,7 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_mapbox_navigation/flutter_mapbox_navigation.dart';
+import 'package:geolocator/geolocator.dart';
 
 void main() {
   runApp(const MyApp());
@@ -37,58 +39,65 @@ class _MapViewState extends State<MapView> {
   bool _isNavigating = false;
   bool _arrived = false;
   late MapBoxOptions _navigationOption;
-
-  Future<void> initialize() async {
-    if (!mounted) return;
-
-    _navigationOption = MapBoxOptions(
-      initialLatitude: 151.21111,
-      initialLongitude: -33.859972,
-      mode: MapBoxNavigationMode.walking,
-      simulateRoute: true,  // 启用模拟导航
-    );
-
-    MapBoxNavigation.instance.registerRouteEventListener(_onRouteEvent);
-  }
+  Position? _currentPosition;
+  WayPoint? _destination;
+  StreamSubscription<Position>? _positionStreamSubscription;  // 添加位置流订阅变量
 
   @override
   void initState() {
-    initialize();
     super.initState();
+    _initialize();
   }
 
-  @override
-  void dispose() {
-    _controller?.dispose();
-    super.dispose();
+  Future<void> _initialize() async {
+    await _requestLocationPermission();
+
+    // Initialize the listener to listen to the position stream
+    _positionStreamSubscription = Geolocator.getPositionStream(
+      desiredAccuracy: LocationAccuracy.high,
+      distanceFilter: 10,  // set the distance filter to 10 meters
+    ).listen((Position position) {
+      setState(() {
+        print("Current Position: $position");  // print the current position
+        _currentPosition = position;
+        _updateNavigationOptions();  // update the navigation options
+      });
+    });
   }
 
-  void startNavigation() async {
-    if (_controller != null) {
-      final downtown = WayPoint(
-          name: "Downtown Buffalo",
-          latitude: 42.8866177,
-          longitude: -78.8814924
+  void _updateNavigationOptions() {
+    if (_currentPosition != null) {
+      _navigationOption = MapBoxOptions(
+        initialLatitude: _currentPosition!.latitude,
+        initialLongitude: _currentPosition!.longitude,
+        mode: MapBoxNavigationMode.walking,
+        simulateRoute: true,
       );
+    }
+  }
 
-      final townhall = WayPoint(
-          name: "Town Hall",
-          latitude: 32.8866177,
-          longitude: -70.8814924
-      );
+  Future<void> _requestLocationPermission() async {
+    bool serviceEnabled;
+    LocationPermission permission;
 
-      var wayPoints = <WayPoint>[];
-      wayPoints.add(downtown);
-      wayPoints.add(townhall);
+    // Check if location services are enabled
+    serviceEnabled = await Geolocator.isLocationServiceEnabled();
+    if (!serviceEnabled) {
+      await Geolocator.openLocationSettings();
+      return Future.error('Location services are disabled.');
+    }
 
-      // 清除上次的导航状态
-      _routeBuilt = false;
-      _isNavigating = false;
-      _arrived = false;
+    permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.denied) {
+      permission = await Geolocator.requestPermission();
+      if (permission == LocationPermission.denied) {
+        return Future.error('Location permissions are denied');
+      }
+    }
 
-      // 构建并开始导航
-      await _controller?.buildRoute(wayPoints: wayPoints);
-      await _controller?.startNavigation();
+    if (permission == LocationPermission.deniedForever) {
+      return Future.error(
+          'Location permissions are permanently denied, we cannot request permissions.');
     }
   }
 
@@ -98,28 +107,69 @@ class _MapViewState extends State<MapView> {
       appBar: AppBar(
         title: Text("Mapbox Navigation Example"),
       ),
-      body: Column(
+      body: _currentPosition == null
+          ? Center(child: CircularProgressIndicator()) // if current position is null, show a loading indicator
+          : Column(
         children: [
           Expanded(
-            child: Container(
-              color: Colors.grey[100],
-              child: MapBoxNavigationView(
-                options: _navigationOption,
-                onRouteEvent: _onRouteEvent,
-                onCreated: (MapBoxNavigationViewController controller) async {
-                  _controller = controller;
-                  await _controller?.initialize();
-                },
+            child: GestureDetector(
+              onLongPressStart: (details) async {
+                final RenderBox box = context.findRenderObject() as RenderBox;
+                final Offset offset = box.globalToLocal(details.globalPosition);
+
+                // ToDo: Should be a better way to calculate the latitude and longitude
+                final latitude = _currentPosition!.latitude + offset.dy * 0.0001;
+                final longitude = _currentPosition!.longitude + offset.dx * 0.0001;
+
+                _destination = WayPoint(
+                  name: "Selected Location",
+                  latitude: latitude,
+                  longitude: longitude,
+                );
+
+                setState(() {});
+              },
+              child: Container(
+                color: Colors.grey[100],
+                child: MapBoxNavigationView(
+                  options: _navigationOption,
+                  onRouteEvent: _onRouteEvent,
+                  onCreated: (MapBoxNavigationViewController controller) async {
+                    _controller = controller;
+                    await _controller?.initialize();
+                  },
+                ),
               ),
             ),
           ),
           ElevatedButton(
-            onPressed: startNavigation,
+            onPressed: _destination == null ? null : startNavigation, // if the destination is null, disable the button
             child: Text("Start Navigation"),
           ),
         ],
       ),
     );
+  }
+
+  void startNavigation() async {
+    if (_controller != null && _destination != null) {
+      final start = WayPoint(
+        name: "User Location",
+        latitude: _currentPosition!.latitude,
+        longitude: _currentPosition!.longitude,
+      );
+
+      var wayPoints = <WayPoint>[start, _destination!];
+
+      // reset the navigation variables
+      _routeBuilt = false;
+      _isNavigating = false;
+      _arrived = false;
+
+      // reset the instruction
+      await _controller?.buildRoute(wayPoints: wayPoints);
+      await _controller?.startNavigation();
+    }
   }
 
   Future<void> _onRouteEvent(e) async {
@@ -160,5 +210,12 @@ class _MapViewState extends State<MapView> {
         break;
     }
     setState(() {});
+  }
+
+  @override
+  void dispose() {
+    _positionStreamSubscription?.cancel(); // cancel the position stream subscription
+    _controller?.dispose();
+    super.dispose();
   }
 }
